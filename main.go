@@ -1,18 +1,24 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
 var DB *gorm.DB // 数据库实例
+
+var RDB *redis.Client //redis客户端
 
 // 密码加密
 func HashPassword(password string) (string, error) {
@@ -178,7 +184,7 @@ type CreateJobRequest struct {
 }
 
 // 发布岗位
-func CreateJobHandler(db *gorm.DB, c *gin.Context) {
+func CreateJobHandler(db *gorm.DB, c *gin.Context, rdb *redis.Client) {
 	var cJob CreateJobRequest
 	if err := c.ShouldBindJSON(&cJob); err != nil {
 		c.JSON(400, gin.H{"error": "发布失败"})
@@ -193,10 +199,12 @@ func CreateJobHandler(db *gorm.DB, c *gin.Context) {
 		c.JSON(500, gin.H{"error": "岗位写入数据库失败"})
 		return
 	}
+	RDB.Del(c.Request.Context(), "api:job_list")
 	c.JSON(200, gin.H{"message": "岗位发布成功", "job": cJob.Title})
 }
 
-// 查询岗位
+// 原查询岗位
+/*
 func GetJobHandler(db *gorm.DB, c *gin.Context) {
 	var jobs []Job
 	result := db.Find(&jobs)
@@ -206,6 +214,48 @@ func GetJobHandler(db *gorm.DB, c *gin.Context) {
 	}
 	c.JSON(200, gin.H{"data": jobs})
 }
+*/
+
+// 使用redis
+func GetJobHandler(db *gorm.DB, c *gin.Context, rdb *redis.Client) {
+	var jobs []Job
+	cacheKey := "api:job_list"
+	ctx := c.Request.Context()
+	val, err := rdb.Get(ctx, cacheKey).Result()
+	if err == redis.Nil { //redis没有去mysql中找
+		result := db.Find(&jobs)
+		if result.Error != nil {
+			c.JSON(500, gin.H{"error": "岗位查找失败"})
+			return
+		}
+		//找到写入redis
+		//序列化
+		byteData, err := json.Marshal(jobs)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "序列化失败"})
+			return
+		}
+		//写入
+		randomMinutes := rand.Intn(5) + 1
+		finalTime := time.Duration(10+randomMinutes) * time.Minute
+		err_write := rdb.Set(ctx, cacheKey, byteData, finalTime).Err()
+		if err_write != nil {
+			c.JSON(500, gin.H{"error": "写入redis失败"})
+			return
+		}
+		c.JSON(200, gin.H{"data": jobs})
+	} else if err != nil {
+		c.JSON(500, gin.H{"error": "redis崩溃"})
+		return
+	} else {
+		err := json.Unmarshal([]byte(val), &jobs)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "反序列化失败"})
+			return
+		}
+		c.JSON(200, gin.H{"data": jobs})
+	}
+}
 
 // 投递结构体
 type SubmitResumeRequest struct {
@@ -213,8 +263,40 @@ type SubmitResumeRequest struct {
 	Content string `json:"content" binding:"required"`
 }
 
-// 投递函数
-func UploadResumeHandler(db *gorm.DB, c *gin.Context) {
+// 原投递函数
+/*func UploadResumeHandler(db *gorm.DB, c *gin.Context) {
+	var uploadResume SubmitResumeRequest
+	if err := c.ShouldBindJSON(&uploadResume); err != nil {
+		c.JSON(400, gin.H{"error": "提交失败"})
+		return
+	}
+	userid, _ := c.Get("userID")
+	newResume := Resume{
+		UserID:  userid.(uint),
+		JobID:   uploadResume.JobID,
+		Content: uploadResume.Content,
+	}
+	result := db.Create(&newResume)
+	if result.Error != nil {
+		c.JSON(500, gin.H{"error": "简历进入数据库失败"})
+		return
+	}
+	c.JSON(200, gin.H{"message": "提交成功"})
+}
+*/
+//增加限流，每个ID每分钟只能投一次
+func UploadResumeHandler(db *gorm.DB, c *gin.Context, rdb *redis.Client) {
+	userID, _ := c.Get("userID")
+	limitKey := fmt.Sprintf("limit:resume:%d", userID)                                    //为什么要Sprintf?
+	success, err := rdb.SetNX(c.Request.Context(), limitKey, "1", 1*time.Minute).Result() //为什么会被画横线
+	if err != nil {
+		c.JSON(500, gin.H{"error": "系统繁忙"})
+		return
+	}
+	if !success {
+		c.JSON(429, gin.H{"error": "投递太频繁了"})
+		return
+	}
 	var uploadResume SubmitResumeRequest
 	if err := c.ShouldBindJSON(&uploadResume); err != nil {
 		c.JSON(400, gin.H{"error": "提交失败"})
@@ -255,6 +337,19 @@ func main() {
 	}
 	fmt.Println("数据表创建/更新成功")
 
+	RDB = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "", // 默认没有密码
+		DB:       0,  // 默认数据库
+	})
+
+	// 建议：尝试 Ping 一下，确保 Redis 真的连上了
+	_, err = RDB.Ping(context.Background()).Result()
+	if err != nil {
+		log.Fatalf("连接 Redis 失败: %v", err)
+	}
+	fmt.Println("Redis 连接成功")
+
 	r.POST("/api/register", func(c *gin.Context) { RegisterHandler(db, c) })
 	r.POST("/api/login", func(c *gin.Context) { LogInHandler(db, c) })
 	protected := r.Group("/api")
@@ -267,14 +362,14 @@ func main() {
 		})
 
 		protected.POST("/jobs", func(c *gin.Context) {
-			CreateJobHandler(db, c)
+			CreateJobHandler(db, c, RDB)
 		})
 
 		protected.GET("/jobs", func(c *gin.Context) {
-			GetJobHandler(db, c)
+			GetJobHandler(db, c, RDB)
 		})
 		protected.POST("/resumes/upload", func(c *gin.Context) {
-			UploadResumeHandler(db, c)
+			UploadResumeHandler(db, c, RDB)
 		})
 	}
 
