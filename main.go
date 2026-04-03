@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
@@ -19,6 +20,8 @@ import (
 var DB *gorm.DB // 数据库实例
 
 var RDB *redis.Client //redis客户端
+
+var MQChannel *amqp.Channel
 
 // 密码加密
 func HashPassword(password string) (string, error) {
@@ -258,7 +261,8 @@ func GetJobHandler(db *gorm.DB, c *gin.Context, rdb *redis.Client) {
 }
 
 // 投递结构体
-type SubmitResumeRequest struct {
+type ResumeMessage struct {
+	UserID  uint   `json:"user_id`
 	JobID   uint   `json:"job_id" binding:"required"`
 	Content string `json:"content" binding:"required"`
 }
@@ -285,6 +289,7 @@ type SubmitResumeRequest struct {
 }
 */
 //增加限流，每个ID每分钟只能投一次
+//添加消息队列，改成生产者
 func UploadResumeHandler(db *gorm.DB, c *gin.Context, rdb *redis.Client) {
 	userID, _ := c.Get("userID")
 	limitKey := fmt.Sprintf("limit:resume:%d", userID)                                    //为什么要Sprintf?
@@ -297,23 +302,115 @@ func UploadResumeHandler(db *gorm.DB, c *gin.Context, rdb *redis.Client) {
 		c.JSON(429, gin.H{"error": "投递太频繁了"})
 		return
 	}
-	var uploadResume SubmitResumeRequest
+	var uploadResume ResumeMessage
 	if err := c.ShouldBindJSON(&uploadResume); err != nil {
 		c.JSON(400, gin.H{"error": "提交失败"})
 		return
 	}
 	userid, _ := c.Get("userID")
-	newResume := Resume{
+	msg := ResumeMessage{
 		UserID:  userid.(uint),
 		JobID:   uploadResume.JobID,
 		Content: uploadResume.Content,
 	}
-	result := db.Create(&newResume)
-	if result.Error != nil {
-		c.JSON(500, gin.H{"error": "简历进入数据库失败"})
+	body, err := json.Marshal(msg)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "结构体转换JSON失败"})
 		return
 	}
+	//设置上下文防卡死
+	ctx, canel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer canel() //什么意思？
+
+	err = MQChannel.PublishWithContext(ctx,
+		"",
+		"resume_queue",
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			Body:         body,
+			DeliveryMode: amqp.Persistent,
+		},
+	)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "投递失败"})
+	}
+
 	c.JSON(200, gin.H{"message": "提交成功"})
+}
+
+// 消费者，处理从生产者那里来的消息
+func StartConsume() {
+	msgs, err := MQChannel.Consume(
+		"resume_queue",
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("获取消费通道失败:%v", err)
+	}
+	go func() {
+		for d := range msgs {
+			fmt.Printf("收到新任务:%s\n", d.Body)
+			success := processTask(d.Body)
+			if success {
+				d.Ack(false) //ack是啥？
+			} else {
+				d.Nack(false, true)
+			}
+		}
+	}() //为什么有括号？
+	fmt.Println("消费者已启动,等待中")
+}
+
+func processTask(body []byte) bool {
+	var msg ResumeMessage
+	err := json.Unmarshal(body, &msg)
+	if err != nil {
+		fmt.Println("解析JSON错误:", err)
+		return true
+	}
+	newResume := Resume{
+		UserID:  msg.UserID,
+		JobID:   msg.JobID,
+		Content: msg.Content,
+		Status:  1,
+	}
+	if err := DB.Create(&newResume).Error; err != nil {
+		log.Printf("存入数据库失败:%v", err)
+		return false
+	}
+	log.Printf("简历 [用户:%d -> 岗位:%d] 异步写入成功!", msg.UserID, msg.JobID)
+	return true
+}
+
+func InitMQ() {
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatalf("连接RabbitMQ失败:%v", err)
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("打开MQ通道失败:%v", err)
+	}
+	_, err = ch.QueueDeclare(
+		"resume_queue", //队列名
+		true,           //持久化
+		false,          //自动删除
+		false,          //排他性
+		false,          //不等待
+		nil,            //额外参数
+	)
+	if err != nil {
+		log.Fatalf("生命队列失败:%v", err)
+	}
+	MQChannel = ch
+	fmt.Println("RabbitMQ连接并初始化成功")
 }
 
 func main() {
@@ -372,6 +469,8 @@ func main() {
 			UploadResumeHandler(db, c, RDB)
 		})
 	}
+	InitMQ()
+	StartConsume()
 
 	r.Run()
 }
